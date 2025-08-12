@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pinn_cfd_integrated.py
+
+Features:
+  - Mesh I/O via meshio
+  - Unit handling via pint
+  - Thermo/transport properties via CoolProp (optional)
+  - Chemical kinetics via Cantera (optional)
+  - Differentiable surrogate for properties (PyTorch)
+  - 3D PINN solver (PyTorch) for steady Navier–Stokes + Energy (optional k-epsilon)
+  - Boundary condition enforcement (Dirichlet)
+  - Adaptive residual-based sampling
+  - Export to VTU for ParaView and interactive 3D preview via PyVista (optional)
+  - CLI: train / resume / export / visualize
+Notes:
+  - This file is a template and engineering scaffold. To run fully you must install:
+        pip install numpy meshio pint coolprop cantera pyvista torch tensorboard pydantic
+  - Optional libraries are used when available; the pipeline degrades gracefully otherwise.
+"""
+
+import os
+import sys
+import math
+import time
+import json
+import yaml
+import argparse
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+# ---------------------------
+# Optional dependencies (graceful)
+# ---------------------------
+try:
+    import meshio
+    _HAS_MESHIO = True
+except Exception:
+    meshio = None
+    _HAS_MESHIO = False
+
+try:
+    import CoolProp.CoolProp as CP
+    _HAS_COOLPROP = True
+except Exception:
+    CP = None
+    _HAS_COOLPROP = False
+
+try:
+    import cantera as ct
+    _HAS_CANERA = True
+except Exception:
+    ct = None
+    _HAS_CANERA = False
+
+try:
+    import pyvista as pv
+    _HAS_PYVISTA = True
+except Exception:
+    pv = None
+    _HAS_PYVISTA = False
+
+try:
+    from pint import UnitRegistry
+    _HAS_PINT = True
+except Exception:
+    UnitRegistry = None
+    _HAS_PINT = False
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.autograd import grad
+    _HAS_TORCH = True
+except Exception:
+    torch = None
+    nn = None
+    grad = None
+    _HAS_TORCH = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _HAS_TB = True
+except Exception:
+    SummaryWriter = None
+    _HAS_TB = False
+
+# ---------------------------
+# Default config (human friendly)
+# ---------------------------
+DEFAULT_CONFIG = {
+    "mesh": {"path": "demo_cube.msh", "scale": 1.0},
+    "solver": {
+        "epochs": 2000,
+        "batch_size": 4096,
+        "lr": 1e-3,
+        "turbulence": "none",   # "none" or "k-epsilon"
+        "loss_weights": {"physics": 1.0, "bc": 10.0, "energy": 1.0, "ke": 0.5},
+        "adaptive": {"enabled": True, "candidate_pool": 20000, "select_top_k": 4096, "resample_every": 100}
+    },
+    "properties": {"fluid": "Air", "use_coolprop": False, "use_cantera": False, "surrogate": {"enabled": True}},
+    "boundary_conditions": {
+        "inlet": {"face": "xmin", "field": "velocity", "value": [1.0, 0.0, 0.0]},
+        "outlet": {"face": "xmax", "field": "pressure", "value": 101325.0},
+        "walls": {"face": "ymin,ymax,zmin,zmax", "field": "velocity", "value": [0.0, 0.0, 0.0]}
+    },
+    "chemistry": {"enabled": False, "mechanism": "gri30.yaml"},
+    "output": {"results_dir": "results", "save_interval": 200},
+    "logging": {"level": "INFO", "file": "pinn_cfd.log"},
+    "tensorboard": {"enabled": True, "logdir": "tb_logs"},
+    "visualization": {"pyvista": True}
+}
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def ensure_optional(name: str, available: bool):
+    if not available:
+        logging.warning(f"Optional dependency '{name}' not found -- corresponding features disabled.")
+
+
+def write_default_config(path: str = "system_config.yaml"):
+    p = Path(path)
+    if not p.exists():
+        p.write_text(yaml.safe_dump(DEFAULT_CONFIG))
+        print(f"[info] Wrote default config to {path}")
+
+
+def load_config(path: str = "system_config.yaml") -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        write_default_config(path)
+    cfg = yaml.safe_load(p.read_text()) or {}
+    merged = DEFAULT_CONFIG.copy()
+    # shallow merge top-level dicts
+    for k, v in cfg.items():
+        if k in merged and isinstance(merged[k], dict):
+            merged[k].update(v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def setup_logging(cfg: Dict[str, Any]):
+    level = cfg.get("logging", {}).get("level", "INFO").upper()
+    numeric = getattr(logging, level, logging.INFO)
+    log_file = cfg.get("logging", {}).get("file", "pinn_cfd.log")
+    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers.insert(0, logging.FileHandler(log_file))
+    logging.basicConfig(level=numeric, format="%(asctime)s | %(levelname)-7s | %(message)s", handlers=handlers)
+    logging.info("Logger configured.")
+
+
+# ---------------------------
+# Mesh helper (3D)
+# ---------------------------
+class MeshHelper:
+    """
+    Simple mesh loader and boundary sampling helper.
+    Works with meshio Mesh objects and supplies nodes/cells + sample points on bounding faces.
+    """
+
+    def __init__(self, mesh_path: str, scale: float = 1.0):
+        if not _HAS_MESHIO:
+            raise RuntimeError("meshio is required for MeshHelper. Install meshio.")
+        self.path = Path(mesh_path)
+        self.scale = float(scale)
+        self.mesh: Optional[meshio.Mesh] = None
+
+    def ensure_demo_mesh(self):
+        if self.path.exists():
+            return
+        logging.info("Demo mesh not found: creating a tiny cube demo mesh.")
+        pts = np.array([[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]], dtype=np.float64)
+        cells = [meshio.CellBlock("tetra", np.array([[0,1,2,5],[0,2,3,7],[0,5,6,7],[0,4,5,7],[0,2,5,7]]))]
+        demo = meshio.Mesh(points=pts, cells=cells)
+        meshio.write(str(self.path), demo)
+        logging.info(f"Demo mesh written to {self.path}")
+
+    def load(self) -> meshio.Mesh:
+        self.ensure_demo_mesh()
+        self.mesh = meshio.read(str(self.path))
+        if self.scale != 1.0:
+            self.mesh.points = self.mesh.points * self.scale
+        logging.info(f"Loaded mesh: {len(self.mesh.points)} points, {len(self.mesh.cells)} cell blocks.")
+        return self.mesh
+
+    def nodes_cells(self) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]]]:
+        if self.mesh is None:
+            self.load()
+        nodes = np.asarray(self.mesh.points, dtype=np.float64)
+        cells = []
+        for block in self.mesh.cells:
+            if hasattr(block, "type") and hasattr(block, "data"):
+                cells.append((block.type, np.asarray(block.data, dtype=np.int32)))
+            else:
+                t, d = block
+                cells.append((t, np.asarray(d, dtype=np.int32)))
+        return nodes, cells
+
+    def sample_face(self, face_str: str, n: int = 512) -> np.ndarray:
+        """
+        Sample points from mesh points that lie approximately on the bounding face.
+        face_str: one of xmin,xmax,ymin,ymax,zmin,zmax
+        """
+        if self.mesh is None:
+            self.load()
+        pts = np.asarray(self.mesh.points)
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        mapping = {
+            "xmin": (0, mins[0]), "xmax": (0, maxs[0]),
+            "ymin": (1, mins[1]), "ymax": (1, maxs[1]),
+            "zmin": (2, mins[2]), "zmax": (2, maxs[2])
+        }
+        if face_str not in mapping:
+            raise ValueError("face_str must be one of xmin,xmax,ymin,ymax,zmin,zmax")
+        axis, val = mapping[face_str]
+        tol = 1e-6 * (maxs[axis] - mins[axis] + 1e-12)
+        mask = np.isclose(pts[:, axis], val, atol=tol)
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            # fallback: choose nearest points to plane
+            dists = np.abs(pts[:, axis] - val)
+            idx = np.argsort(dists)[:max(1, n)]
+        chosen = np.random.choice(idx, size=min(len(idx), n), replace=(len(idx) < n))
+        return pts[chosen, :]
+
+
+# ---------------------------
+# Property provider
+# ---------------------------
+class PropertyProvider:
+    """
+    Query thermophysical properties at (T [K], P [Pa]).
+    Primary backend: CoolProp (if configured and available).
+    Secondary: Cantera (if configured).
+    Fallback: simple air-like approximations.
+    Also provides enthalpy and entropy if CoolProp or Cantera available.
+    """
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.fluid = cfg.get("properties", {}).get("fluid", "Air")
+        self.use_coolprop = bool(cfg.get("properties", {}).get("use_coolprop", False) and _HAS_COOLPROP)
+        self.use_cantera = bool(cfg.get("properties", {}).get("use_cantera", False) and _HAS_CANERA)
+        self.cantera_gas = None
+        if self.use_cantera:
+            try:
+                mech = cfg.get("chemistry", {}).get("mechanism", "gri30.yaml")
+                self.cantera_gas = ct.Solution(mech)
+                logging.info(f"Cantera initialized with mechanism {mech}")
+            except Exception as e:
+                logging.warning(f"Could not initialize Cantera: {e}")
+                self.cantera_gas = None
+                self.use_cantera = False
+
+    def query(self, T: float, P: float) -> Dict[str, float]:
+        """
+        Return dict with keys: rho, mu, cp, k_th, h (enthalpy), s (entropy)
+        Values are floats in SI units.
+        """
+        try:
+            if self.use_coolprop:
+                rho = CP.PropsSI("D", "T", T, "P", P, self.fluid)
+                mu = CP.PropsSI("V", "T", T, "P", P, self.fluid)
+                cp = CP.PropsSI("C", "T", T, "P", P, self.fluid)
+                k_th = CP.PropsSI("L", "T", T, "P", P, self.fluid)
+                h = CP.PropsSI("H", "T", T, "P", P, self.fluid)
+                s = CP.PropsSI("S", "T", T, "P", P, self.fluid)
+                return {"rho": float(rho), "mu": float(mu), "cp": float(cp), "k_th": float(k_th), "h": float(h), "s": float(s)}
+            if self.use_cantera and self.cantera_gas is not None:
+                self.cantera_gas.TP = T, P
+                rho = self.cantera_gas.density
+                mu = self.cantera_gas.viscosity
+                cp = self.cantera_gas.cp_mass
+                k_th = self.cantera_gas.thermal_conductivity
+                h = self.cantera_gas.enthalpy_mass
+                s = self.cantera_gas.entropy_mass
+                return {"rho": float(rho), "mu": float(mu), "cp": float(cp), "k_th": float(k_th), "h": float(h), "s": float(s)}
+        except Exception as e:
+            logging.debug(f"Property backend error: {e}")
+
+        # fallback (ideal gas / simple correlations)
+        R = 287.058  # J/kg/K for dry air
+        rho = P / (R * max(T, 1e-6))
+        mu = 1.8e-5 * (T / 300.0) ** 0.7
+        cp = 1005.0
+        k_th = 0.026
+        h = cp * T
+        s = cp * math.log(max(T, 1e-6)) - R * math.log(max(P, 1e-6))
+        return {"rho": float(rho), "mu": float(mu), "cp": float(cp), "k_th": float(k_th), "h": float(h), "s": float(s)}
+
+
+# ---------------------------
+# Property surrogate (PyTorch)
+# ---------------------------
+if _HAS_TORCH:
+    class PropertySurrogate(nn.Module):
+        """
+        Small differentiable MLP that predicts [rho, mu, cp, k_th, h, s] from (T,P).
+        Use this when calling property backends pointwise is too expensive during PINN residual evaluation.
+        """
+
+        def __init__(self, hidden: List[int] = [64, 64]):
+            super().__init__()
+            layers = []
+            last = 2
+            for h in hidden:
+                layers.append(nn.Linear(last, h))
+                layers.append(nn.ReLU())
+                last = h
+            layers.append(nn.Linear(last, 6))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, tp: torch.Tensor) -> torch.Tensor:
+            # tp: (N,2) where columns are T (K) and P (Pa)
+            return self.net(tp)
+
+
+    def make_property_dataset(provider: PropertyProvider, n: int = 3000, T_range=(200, 1500), P_range=(5e4, 5e6)):
+        T = np.random.uniform(T_range[0], T_range[1], size=(n,))
+        P = np.random.uniform(P_range[0], P_range[1], size=(n,))
+        X = np.stack([T, P], axis=1).astype(np.float32)
+        Y = np.zeros((n, 6), dtype=np.float32)
+        for i, (t, p) in enumerate(X):
+            q = provider.query(float(t), float(p))
+            Y[i, :] = np.array([q["rho"], q["mu"], q["cp"], q["k_th"], q["h"], q["s"]], dtype=np.float32)
+        return X, Y
+
+
+    def train_property_surrogate(cfg: Dict[str, Any], provider: PropertyProvider, device: torch.device, save_path: str):
+        sconf = cfg.get("properties", {}).get("surrogate", {})
+        hidden = sconf.get("hidden", [64, 64])
+        epochs = int(sconf.get("epochs", 300))
+        lr = float(sconf.get("lr", 1e-3))
+        X, Y = make_property_dataset(provider, n=3000)
+        X_t = torch.tensor(X, dtype=torch.float32, device=device)
+        Y_t = torch.tensor(Y, dtype=torch.float32, device=device)
+        model = PropertySurrogate(hidden).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+        logging.info("Training property surrogate network...")
+        for ep in range(1, epochs + 1):
+            idx = torch.randperm(X_t.shape[0], device=device)
+            xb = X_t[idx]
+            yb = Y_t[idx]
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if ep % 50 == 0 or ep == 1 or ep == epochs:
+                logging.info(f"[surrogate] epoch {ep}/{epochs} loss={loss.item():.4e}")
+        torch.save({"state": model.state_dict(), "hidden": hidden}, save_path)
+        logging.info(f"Saved surrogate to {save_path}")
+        model.eval()
+        return model
+
+
+    def load_property_surrogate(path: str, device: torch.device):
+        d = torch.load(path, map_location=device)
+        hidden = d.get("hidden", [64, 64])
+        model = PropertySurrogate(hidden).to(device)
+        model.load_state_dict(d["state"])
+        model.eval()
+        logging.info(f"Loaded surrogate from {path}")
+        return model
+
+
+# ---------------------------
+# PINN model & solver (PyTorch)
+# ---------------------------
+if _HAS_TORCH:
+    class MLP(nn.Module):
+        def __init__(self, in_dim: int = 3, hidden: List[int] = [128, 128, 128], out_dim: int = 5):
+            super().__init__()
+            layers = []
+            last = in_dim
+            for h in hidden:
+                layers.append(nn.Linear(last, h))
+                layers.append(nn.Tanh())
+                last = h
+            layers.append(nn.Linear(last, out_dim))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+
+
+    class PINNSolver:
+        """
+        High-level PINN solver orchestrating training and export.
+        Supports:
+          - continuity + momentum + energy residuals
+          - optional k-epsilon residuals (simplified)
+          - boundary condition enforcement (Dirichlet)
+          - adaptive sampling using a candidate pool
+        """
+
+        def __init__(self, cfg: Dict[str, Any], nodes: np.ndarray, cells: List[Tuple[str, np.ndarray]],
+                     device: Optional[torch.device] = None, surrogate=None, prop_provider: Optional[PropertyProvider] = None,
+                     tb_writer: Optional[Any] = None):
+            self.cfg = cfg
+            self.nodes = nodes.astype(np.float32)
+            self.cells = cells
+            self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            self.surrogate = surrogate
+            self.prop_provider = prop_provider
+            self.tb = tb_writer
+            scfg = cfg.get("solver", {})
+            self.turb = scfg.get("turbulence", "none")
+            self.out_dim = 5 + (2 if self.turb == "k-epsilon" else 0)  # u,v,w,p,T,(k,eps)
+            self.model = MLP(in_dim=3, hidden=[128,128,128], out_dim=self.out_dim).to(self.device)
+            self.opt = torch.optim.Adam(self.model.parameters(), lr=scfg.get("lr", 1e-3))
+            self.loss_weights = scfg.get("loss_weights", DEFAULT_CONFIG["solver"]["loss_weights"])
+            self.adaptive = scfg.get("adaptive", DEFAULT_CONFIG["solver"]["adaptive"])
+            self.candidate_pool = int(self.adaptive.get("candidate_pool", 20000))
+            self.select_top_k = int(self.adaptive.get("select_top_k", scfg.get("batch_size", 4096)))
+            self.resample_every = int(self.adaptive.get("resample_every", 100))
+            self.candidate_points = None
+            if self.adaptive.get("enabled", False):
+                self._prepare_candidate_pool()
+            self.mesh_helper = MeshHelper(cfg["mesh"]["path"], cfg["mesh"].get("scale",1.0))
+            self.bc_defs = cfg.get("boundary_conditions", {})
+            self.results_dir = Path(cfg.get("output",{}).get("results_dir","results"))
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"PINN initialized on device {self.device} (turbulence={self.turb})")
+
+        def _prepare_candidate_pool(self):
+            mins = self.nodes.min(axis=0)
+            maxs = self.nodes.max(axis=0)
+            pts = np.random.rand(self.candidate_pool, 3) * (maxs - mins) + mins
+            self.candidate_points = torch.tensor(pts, dtype=torch.float32, device=self.device, requires_grad=True)
+            logging.info(f"Prepared candidate pool: {self.candidate_points.shape[0]} points")
+
+        def _random_inside(self, n: int) -> torch.Tensor:
+            mins = self.nodes.min(axis=0)
+            maxs = self.nodes.max(axis=0)
+            pts = np.random.rand(n, 3) * (maxs - mins) + mins
+            return torch.tensor(pts, dtype=torch.float32, device=self.device, requires_grad=True)
+
+        def sample_collocation(self, n: int, epoch: int = 0) -> torch.Tensor:
+            if self.adaptive.get("enabled", False) and (epoch % self.resample_every == 0) and (self.candidate_points is not None):
+                with torch.no_grad():
+                    cp = self.candidate_points.detach().clone().requires_grad_(True)
+                    cont, moms, energy_res, ke_res = self.compute_residuals(cp)
+                    res_mag = torch.abs(cont).sum(dim=1)
+                    for m in moms:
+                        res_mag = res_mag + torch.abs(m).sum(dim=1)
+                    if energy_res is not None:
+                        res_mag = res_mag + torch.abs(energy_res).sum(dim=1)
+                    if ke_res is not None:
+                        res_mag = res_mag + torch.abs(ke_res[0]).sum(dim=1) + torch.abs(ke_res[1]).sum(dim=1)
+                    topk = int(min(self.select_top_k, res_mag.shape[0], n))
+                    if topk <= 0:
+                        return self._random_inside(n)
+                    vals, idx = torch.topk(res_mag, k=topk, largest=True)
+                    pts = self.candidate_points[idx].detach().clone().requires_grad_(True)
+                    if topk < n:
+                        extra = self._random_inside(n - topk)
+                        pts = torch.cat([pts, extra], dim=0).requires_grad_(True)
+                    logging.debug(f"Adaptive sampling selected {topk} points.")
+                    return pts
+            else:
+                return self._random_inside(n)
+
+        def sample_bc(self, bc_name: str, n: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
+            bc = self.bc_defs.get(bc_name)
+            if bc is None:
+                raise KeyError(f"BC '{bc_name}' not found")
+            if "face" in bc and bc["face"]:
+                faces = [f.strip() for f in str(bc["face"]).split(",")]
+                per_face = max(1, n // max(len(faces), 1))
+                pts_list = []
+                for f in faces:
+                    pts_list.append(self.mesh_helper.sample_face(f, per_face))
+                pts_np = np.vstack(pts_list)[:n, :]
+                return torch.tensor(pts_np, dtype=torch.float32, device=self.device, requires_grad=True), bc
+            else:
+                raise ValueError("BC must specify 'face' for this helper")
+
+        def compute_residuals(self, x: torch.Tensor):
+            """
+            Compute physics residuals at collocation points x (N,3).
+            Returns continuity: (N,1), momenta: list of three (N,1), energy_res: (N,1), ke_res: (k_res, eps_res) or None.
+            """
+            x = x.clone().requires_grad_(True)
+            out = self.model(x)
+            idx = 0
+            u = out[:, idx:idx+1]; idx += 1
+            v = out[:, idx:idx+1]; idx += 1
+            w = out[:, idx:idx+1]; idx += 1
+            p = out[:, idx:idx+1]; idx += 1
+            T = out[:, idx:idx+1]; idx += 1
+            k = eps = None
+            if self.turb == "k-epsilon":
+                k = out[:, idx:idx+1]; idx += 1
+                eps = out[:, idx:idx+1]; idx += 1
+
+            def grads(field):
+                g = grad(field.sum(), x, create_graph=True)[0]
+                return g[:,0:1], g[:,1:2], g[:,2:3]
+
+            u_x, u_y, u_z = grads(u)
+            v_x, v_y, v_z = grads(v)
+            w_x, w_y, w_z = grads(w)
+            p_x, p_y, p_z = grads(p)
+            T_x, T_y, T_z = grads(T)
+
+            # properties (differentiable surrogate preferred)
+            if (self.surrogate is not None) and callable(self.surrogate):
+                TP = torch.cat([T, p], dim=1)  # T in K, p in Pa
+                props = self.surrogate(TP)     # (N,6): rho, mu, cp, k_th, h, s
+                rho = props[:, 0:1]
+                mu = props[:, 1:2]
+                cp = props[:, 2:3]
+                k_th = props[:, 3:4]
+            elif self.prop_provider is not None:
+                T_np = T.detach().cpu().numpy().flatten()
+                p_np = p.detach().cpu().numpy().flatten()
+                rhos = []; mus = []; cps = []; k_ths = []
+                for Ti, Pi in zip(T_np, p_np):
+                    q = self.prop_provider.query(float(Ti), float(Pi))
+                    rhos.append(q["rho"]); mus.append(q["mu"]); cps.append(q["cp"]); k_ths.append(q["k_th"])
+                rho = torch.tensor(np.array(rhos, dtype=np.float32)).reshape(-1,1).to(self.device)
+                mu = torch.tensor(np.array(mus, dtype=np.float32)).reshape(-1,1).to(self.device)
+                cp = torch.tensor(np.array(cps, dtype=np.float32)).reshape(-1,1).to(self.device)
+                k_th = torch.tensor(np.array(k_ths, dtype=np.float32)).reshape(-1,1).to(self.device)
+            else:
+                rho = torch.ones_like(u) * 1.0
+                mu = torch.ones_like(u) * 1.8e-5
+                cp = torch.ones_like(u) * 1005.0
+                k_th = torch.ones_like(u) * 0.026
+
+            # continuity (compressible-like form simplified)
+            cont = grad((rho * u).sum(), x, create_graph=True)[0][:,0:1] + \
+                   grad((rho * v).sum(), x, create_graph=True)[0][:,1:2] + \
+                   grad((rho * w).sum(), x, create_graph=True)[0][:,2:3]
+
+            # convective terms
+            conv_x = rho * (u * u_x + v * u_y + w * u_z)
+            conv_y = rho * (u * v_x + v * v_y + w * v_z)
+            conv_z = rho * (u * w_x + v * w_y + w * w_z)
+
+            # Laplacian-like viscous terms (approx)
+            def laplacian(comp, grads_comp):
+                cx, cy, cz = grads_comp
+                cxx = grad(cx.sum(), x, create_graph=True)[0][:,0:1]
+                cyy = grad(cy.sum(), x, create_graph=True)[0][:,1:2]
+                czz = grad(cz.sum(), x, create_graph=True)[0][:,2:3]
+                return cxx + cyy + czz
+
+            lap_u = laplacian(u, (u_x, u_y, u_z))
+            lap_v = laplacian(v, (v_x, v_y, v_z))
+            lap_w = laplacian(w, (w_x, w_y, w_z))
+
+            if (k is not None) and (eps is not None):
+                C_mu = 0.09
+                nut = C_mu * (k ** 2) / (eps + 1e-10)
+                mu_eff = mu + nut
+            else:
+                mu_eff = mu
+
+            mom_x = conv_x + p_x - mu_eff * lap_u
+            mom_y = conv_y + p_y - mu_eff * lap_v
+            mom_z = conv_z + p_z - mu_eff * lap_w
+
+            # energy residual (advection - conduction simplified)
+            adv_T = rho * cp * (u * T_x + v * T_y + w * T_z)
+            kTx = k_th * T_x; kTy = k_th * T_y; kTz = k_th * T_z
+            div_kT = grad(kTx.sum(), x, create_graph=True)[0][:,0:1] + \
+                    grad(kTy.sum(), x, create_graph=True)[0][:,1:2] + \
+                    grad(kTz.sum(), x, create_graph=True)[0][:,2:3]
+            energy_res = adv_T - div_kT
+
+            ke_res = None
+            if (k is not None) and (eps is not None):
+                # simplified k-epsilon transport residual placeholders
+                Ssq = (u_x**2 + v_y**2 + w_z**2 +
+                       0.5*(u_y+v_x)**2 + 0.5*(u_z+w_x)**2 + 0.5*(v_z+w_y)**2)
+                production = mu_eff * Ssq
+                k_res = production - rho * eps
+                C1 = 1.44; C2 = 1.92
+                eps_res = C1 * production * (eps / (k + 1e-8)) - C2 * rho * (eps ** 2) / (k + 1e-8)
+                ke_res = (k_res, eps_res)
+
+            return cont, [mom_x, mom_y, mom_z], energy_res, ke_res
+
+        def boundary_loss(self, n_sample: int = 512) -> torch.Tensor:
+            total = torch.tensor(0.0, device=self.device)
+            if not self.bc_defs:
+                return total
+            for name, spec in self.bc_defs.items():
+                try:
+                    pts, bc = self.sample_bc(name, n_sample)
+                except Exception as e:
+                    logging.debug(f"[bc] sample failed for '{name}': {e}")
+                    continue
+                out = self.model(pts)
+                idx = 0
+                u = out[:, idx:idx+1]; idx+=1
+                v = out[:, idx:idx+1]; idx+=1
+                w = out[:, idx:idx+1]; idx+=1
+                p = out[:, idx:idx+1]; idx+=1
+                T = out[:, idx:idx+1]; idx+=1
+                if bc.get("field") == "velocity":
+                    val = bc.get("value", [0.0,0.0,0.0])
+                    target = torch.tensor(val, dtype=torch.float32, device=self.device).reshape(1,3)
+                    tgt = target.expand(pts.shape[0],3)
+                    pred = torch.cat([u,v,w], dim=1)
+                    total = total + nn.MSELoss()(pred, tgt)
+                elif bc.get("field") == "pressure":
+                    val = float(bc.get("value", 101325.0))
+                    total = total + nn.MSELoss()(p, torch.full_like(p, val))
+                elif bc.get("field") == "temperature":
+                    val = float(bc.get("value", 300.0))
+                    total = total + nn.MSELoss()(T, torch.full_like(T, val))
+                else:
+                    logging.debug(f"[bc] unknown bc field: {bc.get('field')}")
+            return total
+
+        def train(self, epochs: int = 2000, batch_size: int = 4096, checkpoint_interval: int = 200):
+            history = {"loss_total": [], "loss_phys": [], "loss_bc": [], "loss_energy": []}
+            save_dir = self.results_dir / "checkpoints"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            for ep in range(1, epochs+1):
+                coll = self.sample_collocation(batch_size, epoch=ep)
+                cont, moms, energy_res, ke_res = self.compute_residuals(coll)
+                mse = nn.MSELoss()
+                loss_phys = mse(cont, torch.zeros_like(cont))
+                for m in moms:
+                    loss_phys = loss_phys + mse(m, torch.zeros_like(m))
+                loss_energy = torch.tensor(0.0, device=self.device)
+                if energy_res is not None:
+                    loss_energy = mse(energy_res, torch.zeros_like(energy_res))
+                loss_ke = torch.tensor(0.0, device=self.device)
+                if ke_res is not None:
+                    loss_ke = mse(ke_res[0], torch.zeros_like(ke_res[0])) + mse(ke_res[1], torch.zeros_like(ke_res[1]))
+                loss_bc = self.boundary_loss(n_sample=min(512, batch_size//4))
+                w_phys = float(self.loss_weights.get("physics", 1.0))
+                w_bc = float(self.loss_weights.get("bc", 10.0))
+                w_energy = float(self.loss_weights.get("energy", 1.0))
+                w_ke = float(self.loss_weights.get("ke", 0.5))
+                loss_total = w_phys * loss_phys + w_bc * loss_bc + w_energy * loss_energy + w_ke * loss_ke
+                self.opt.zero_grad()
+                loss_total.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.opt.step()
+
+                history["loss_total"].append(float(loss_total.item()))
+                history["loss_phys"].append(float(loss_phys.item()))
+                history["loss_bc"].append(float(loss_bc.item()))
+                history["loss_energy"].append(float(loss_energy.item()))
+
+                if ep % 10 == 0 or ep == 1:
+                    logging.info(f"[train] ep {ep}/{epochs} total={loss_total.item():.4e} phys={loss_phys.item():.4e} bc={loss_bc.item():.4e} energy={loss_energy.item():.4e}")
+
+                if self.tb is not None:
+                    self.tb.add_scalar("loss/total", float(loss_total.item()), ep)
+                    self.tb.add_scalar("loss/physics", float(loss_phys.item()), ep)
+                    self.tb.add_scalar("loss/bc", float(loss_bc.item()), ep)
+                    self.tb.add_scalar("loss/energy", float(loss_energy.item()), ep)
+
+                if ep % checkpoint_interval == 0 or ep == epochs:
+                    ckpt = {"epoch": ep, "model_state": self.model.state_dict(), "opt_state": self.opt.state_dict()}
+                    torch.save(ckpt, save_dir / f"pinn_ckpt_ep{ep}.pt")
+                    logging.info(f"Saved checkpoint: {save_dir / f'pinn_ckpt_ep{ep}.pt'}")
+
+            return history
+
+        def predict_on_nodes(self) -> Dict[str, np.ndarray]:
+            pts = torch.tensor(self.nodes, dtype=torch.float32, device=self.device)
+            self.model.eval()
+            with torch.no_grad():
+                out = self.model(pts).cpu().numpy()
+            res = {"coordinates": self.nodes}
+            res["velocity"] = out[:, 0:3]
+            res["pressure"] = out[:, 3:4]
+            res["temperature"] = out[:, 4:5]
+            idx = 5
+            if self.turb == "k-epsilon":
+                res["k"] = out[:, idx:idx+1]; idx += 1
+                res["epsilon"] = out[:, idx:idx+1]; idx += 1
+            # properties
+            if (self.surrogate is not None):
+                TP = np.column_stack([res["temperature"].flatten(), res["pressure"].flatten()]).astype(np.float32)
+                with torch.no_grad():
+                    props = self.surrogate(torch.tensor(TP, dtype=torch.float32, device=self.device)).cpu().numpy()
+                res["density"] = props[:, 0:1]
+                res["viscosity"] = props[:, 1:2]
+                res["cp"] = props[:, 2:3]
+                res["k_th"] = props[:, 3:4]
+                res["enthalpy"] = props[:, 4:5]
+                res["entropy"] = props[:, 5:6]
+            elif self.prop_provider is not None:
+                Tvals = res["temperature"].flatten(); Pvals = res["pressure"].flatten()
+                dens=[]; visc=[]; cps=[]; kths=[]; hs=[]; ss=[]
+                for Ti, Pi in zip(Tvals, Pvals):
+                    q = self.prop_provider.query(float(Ti), float(Pi))
+                    dens.append(q["rho"]); visc.append(q["mu"]); cps.append(q["cp"]); kths.append(q["k_th"]); hs.append(q["h"]); ss.append(q["s"])
+                res["density"] = np.array(dens).reshape(-1,1)
+                res["viscosity"] = np.array(visc).reshape(-1,1)
+                res["cp"] = np.array(cps).reshape(-1,1)
+                res["k_th"] = np.array(kths).reshape(-1,1)
+                res["enthalpy"] = np.array(hs).reshape(-1,1)
+                res["entropy"] = np.array(ss).reshape(-1,1)
+            return res
+
+        def export_vtu(self, tag: str = "final") -> Path:
+            out = self.predict_on_nodes()
+            mesh_cells = [meshio.CellBlock(ct, np.asarray(arr, dtype=np.int32)) for ct, arr in self.cells]
+            point_data = {}
+            point_data["velocity"] = np.asarray(out["velocity"], dtype=np.float32)
+            point_data["pressure"] = np.asarray(out["pressure"], dtype=np.float32).reshape(-1, 1)
+            point_data["temperature"] = np.asarray(out["temperature"], dtype=np.float32).reshape(-1, 1)
+            for k in ["density","viscosity","cp","k_th","enthalpy","entropy","k","epsilon"]:
+                if k in out:
+                    point_data[k] = np.asarray(out[k], dtype=np.float32)
+            mesh = meshio.Mesh(points=out["coordinates"], cells=mesh_cells, point_data=point_data)
+            out_path = self.results_dir / f"results_{tag}.vtu"
+            meshio.write(str(out_path), mesh)
+            logging.info(f"Exported results to {out_path}")
+            return out_path
+
+        def visualize_pyvista(self, tag: str = "final"):
+            if not _HAS_PYVISTA:
+                logging.error("PyVista not available.")
+                return None
+            out = self.predict_on_nodes()
+            grid = pv.PolyData(out["coordinates"])
+            grid["pressure"] = out["pressure"].flatten()
+            grid["temperature"] = out["temperature"].flatten()
+            grid["velocity_x"] = out["velocity"][:,0]
+            pl = pv.Plotter()
+            pl.add_mesh(grid, scalars="temperature", point_size=5, render_points_as_spheres=True, show_scalar_bar=True)
+            pl.add_axes()
+            pl.show(title=f"PINN CFD {tag}")
+            return True
+
+
+# ---------------------------
+# Command implementations
+# ---------------------------
+def cmd_train(args):
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+    ensure_optional("meshio", _HAS_MESHIO)
+    ensure_optional("CoolProp", _HAS_COOLPROP)
+    ensure_optional("Cantera", _HAS_CANERA)
+    ensure_optional("PyVista", _HAS_PYVISTA)
+    ensure_optional("Pint", _HAS_PINT)
+    ensure_optional("PyTorch", _HAS_TORCH)
+
+    tb = None
+    if cfg.get("tensorboard", {}).get("enabled", True) and _HAS_TB:
+        tb = SummaryWriter(log_dir=cfg.get("tensorboard", {}).get("logdir", "tb_logs"))
+        logging.info("TensorBoard enabled.")
+    else:
+        if cfg.get("tensorboard", {}).get("enabled", True):
+            logging.warning("TensorBoard requested but not available.")
+
+    mesh_helper = MeshHelper(cfg["mesh"]["path"], cfg["mesh"].get("scale",1.0))
+    mesh = mesh_helper.load()
+    nodes, cells = mesh_helper.nodes_cells()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if _HAS_TORCH else None
+    prop_provider = PropertyProvider(cfg) if (cfg.get("properties", {}).get("use_coolprop") or cfg.get("properties", {}).get("use_cantera")) else PropertyProvider(cfg)
+
+    surrogate = None
+    surrogate_path = Path(cfg.get("output", {}).get("results_dir", "results")) / "surrogate.pth"
+    if _HAS_TORCH and cfg.get("properties", {}).get("surrogate", {}).get("enabled", True):
+        if surrogate_path.exists():
+            surrogate = load_property_surrogate(str(surrogate_path), device)
+        else:
+            surrogate = train_property_surrogate(cfg, prop_provider, device, str(surrogate_path))
+
+    if not _HAS_TORCH:
+        logging.error("PyTorch required for training. Aborting.")
+        return
+
+    solver = PINNSolver(cfg, nodes, cells, device=device, surrogate=surrogate, prop_provider=prop_provider, tb_writer=tb)
+    hist = solver.train(epochs=cfg["solver"].get("epochs",2000),
+                        batch_size=cfg["solver"].get("batch_size",4096),
+                        checkpoint_interval=cfg["output"].get("save_interval",200))
+    solver.export_vtu(tag="final")
+    if cfg.get("visualization", {}).get("pyvista", True):
+        try:
+            solver.visualize_pyvista(tag="final")
+        except Exception as e:
+            logging.warning(f"Visualization failed: {e}")
+    if tb:
+        tb.close()
+
+
+def cmd_resume(args):
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+    if not _HAS_TORCH:
+        logging.error("PyTorch required to resume training.")
+        return
+    mesh_helper = MeshHelper(cfg["mesh"]["path"], cfg["mesh"].get("scale",1.0))
+    mesh_helper.load()
+    nodes, cells = mesh_helper.nodes_cells()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop_provider = PropertyProvider(cfg)
+    surrogate_path = Path(cfg.get("output", {}).get("results_dir","results")) / "surrogate.pth"
+    surrogate = load_property_surrogate(str(surrogate_path), device) if surrogate_path.exists() else None
+    solver = PINNSolver(cfg, nodes, cells, device=device, surrogate=surrogate, prop_provider=prop_provider)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    solver.model.load_state_dict(ckpt.get("model_state", {}))
+    solver.opt.load_state_dict(ckpt.get("opt_state", {}))
+    logging.info(f"Resumed from checkpoint {args.checkpoint}")
+    solver.train(epochs=cfg["solver"].get("epochs",2000),
+                 batch_size=cfg["solver"].get("batch_size",4096),
+                 checkpoint_interval=cfg["output"].get("save_interval",200))
+    solver.export_vtu(tag="resumed")
+
+
+def cmd_export(args):
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+    if not _HAS_MESHIO or not _HAS_TORCH:
+        logging.error("meshio and PyTorch are required for export.")
+        return
+    mesh_helper = MeshHelper(cfg["mesh"]["path"], cfg["mesh"].get("scale",1.0))
+    mesh_helper.load()
+    nodes, cells = mesh_helper.nodes_cells()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop_provider = PropertyProvider(cfg)
+    surrogate_path = Path(cfg.get("output", {}).get("results_dir","results")) / "surrogate.pth"
+    surrogate = load_property_surrogate(str(surrogate_path), device) if surrogate_path.exists() else None
+    solver = PINNSolver(cfg, nodes, cells, device=device, surrogate=surrogate, prop_provider=prop_provider)
+    ckpt_dir = Path(cfg.get("output", {}).get("results_dir","results")) / "checkpoints"
+    if not ckpt_dir.exists():
+        logging.error("No checkpoints found. Run training first.")
+        return
+    ckpts = sorted(list(ckpt_dir.glob("pinn_ckpt_ep*.pt")), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        logging.error("No checkpoints found. Run training first.")
+        return
+    ckpt = torch.load(str(ckpts[-1]), map_location=device)
+    solver.model.load_state_dict(ckpt.get("model_state", {}))
+    solver.export_vtu(tag="export")
+
+
+def cmd_visualize(args):
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+    if not _HAS_PYVISTA or not _HAS_TORCH:
+        logging.error("PyVista and PyTorch required for visualization.")
+        return
+    mesh_helper = MeshHelper(cfg["mesh"]["path"], cfg["mesh"].get("scale",1.0))
+    mesh_helper.load()
+    nodes, cells = mesh_helper.nodes_cells()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prop_provider = PropertyProvider(cfg)
+    surrogate_path = Path(cfg.get("output", {}).get("results_dir","results")) / "surrogate.pth"
+    surrogate = load_property_surrogate(str(surrogate_path), device) if surrogate_path.exists() else None
+    solver = PINNSolver(cfg, nodes, cells, device=device, surrogate=surrogate, prop_provider=prop_provider)
+    ckpt_dir = Path(cfg.get("output", {}).get("results_dir","results")) / "checkpoints"
+    if not ckpt_dir.exists():
+        logging.error("No checkpoints found. Run training first.")
+        return
+    ckpts = sorted(list(ckpt_dir.glob("pinn_ckpt_ep*.pt")), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        logging.error("No checkpoints found.")
+        return
+    ckpt = torch.load(str(ckpts[-1]), map_location=device)
+    solver.model.load_state_dict(ckpt.get("model_state", {}))
+    solver.visualize_pyvista(tag="visualize")
+
+
+# ---------------------------
+# Entry point / CLI
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="PINN-CFD integrated 3D pipeline (human-style)")
+    parser.add_argument("-c", "--config", default="system_config.yaml", help="Path to YAML config file")
+    sub = parser.add_subparsers(dest="command")
+
+    p_train = sub.add_parser("train", help="Train PINN and property surrogate (if enabled)")
+    p_train.set_defaults(func=cmd_train)
+
+    p_resume = sub.add_parser("resume", help="Resume training from checkpoint")
+    p_resume.add_argument("checkpoint", help="Path to checkpoint .pt")
+    p_resume.set_defaults(func=cmd_resume)
+
+    p_export = sub.add_parser("export", help="Export latest checkpoint predictions to VTU")
+    p_export.set_defaults(func=cmd_export)
+
+    p_vis = sub.add_parser("visualize", help="Visualize latest checkpoint with PyVista")
+    p_vis.set_defaults(func=cmd_visualize)
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
