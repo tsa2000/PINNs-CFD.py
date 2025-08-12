@@ -1,0 +1,22 @@
+# config.yaml - project configuration
+mesh_file: "demo_cube.vtk"
+fluid: "Hydrogen"
+pressure: 101325
+temperature: 300
+hidden_sizes: [128, 128, 128]
+epochs: 500
+batch_size: 2048
+learning_rate: 0.001
+results_dir: "results"
+boundary_conditions:
+  inlet:
+    face: "xmin"
+    field: "velocity"
+    value: [1.0, 0.0, 0.0]
+  outlet:
+    face: "xmax"
+    field: "pressure"
+    value: 101325.0
+w_phys: 1.0
+w_bc: 10.0
+w_energy: 1.0
