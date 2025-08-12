@@ -1,0 +1,10 @@
+torch
+numpy
+meshio
+pint
+CoolProp
+cantera
+matplotlib
+pyvista
+pyyaml
+tqdm
