@@ -1,0 +1,80 @@
+# PINN-CFD Project
+
+## 📌 Overview
+This project integrates **Physics-Informed Neural Networks (PINNs)** with **Computational Fluid Dynamics (CFD)** for solving steady-state Navier–Stokes and energy equations.  
+It supports mesh-based simulations, thermodynamic/transport properties, and optional chemical kinetics.
+
+---
+
+## 📂 Project Structure
+```
+pinn_cfd_project/
+│
+├── mesh_handler.py       # Load, save, and preprocess meshes
+├── physics_model.py      # Governing equations and fluid properties
+├── pinn_solver.py        # Physics-Informed Neural Network solver
+├── config.yaml           # Global configuration
+├── utils.py              # Helper functions (e.g., read config)
+├── main.py               # Entry point
+└── requirements.txt      # Required dependencies
+```
+
+---
+
+## ⚙️ Features
+- **Mesh I/O** via `meshio`
+- **Unit handling** via `pint`
+- **Thermo/transport properties** via `CoolProp` (optional)
+- **Chemical kinetics** via `Cantera` (optional)
+- **3D PINN solver** using PyTorch
+- Flexible configuration via `config.yaml`
+
+---
+
+## 📦 Requirements
+Install dependencies using:
+```bash
+pip install -r requirements.txt
+```
+
+### Core Dependencies:
+- `numpy`
+- `torch`
+- `meshio`
+- `pint`
+- *(optional)* `CoolProp`, `Cantera`
+
+---
+
+## 🚀 Usage
+Run the main script:
+```bash
+python main.py
+```
+
+### Configuration:
+Modify `config.yaml` to adjust:
+- Mesh paths
+- Fluid properties
+- Solver parameters (learning rate, epochs, etc.)
+- Physics settings (e.g., Reynolds number)
+
+---
+
+## 🧪 Example Workflow
+1. Prepare a mesh using SALOME or another mesh generator.
+2. Save it in a format supported by `meshio` (e.g., `.msh`, `.xml`).
+3. Update `config.yaml` with the mesh file path and simulation settings.
+4. Run `main.py` to start training and simulation.
+5. Check logs and output files for results.
+
+---
+
+## 📜 License
+MIT License – feel free to use, modify, and share.
+
+---
+
+## 👤 Author
+Developed by **Thaer Abushawer**  
+For research in AI-augmented CFD and energy systems.
